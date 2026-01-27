@@ -3,8 +3,8 @@
 This project demonstrates the **Transactional Outbox Pattern** for Event-Driven Architecture using AWS services. The architecture ensures reliable event publishing by writing events to an outbox table within the same database transaction as the business data.
 
 Read the accompanying documentation for further details:
-- Article format: [`Implementing the Transactional Outbox Pattern for Event-Driven Architecture in AWS`](./docs/implement-transactional-outbox-aws.md) 
-- Architecture Decision Record format: ([`ADR`](./docs/adr.md))
+- Article format: [`./docs/implement-transactional-outbox-aws.md`](./docs/implement-transactional-outbox-aws.md) 
+- Architecture Decision Record format: [`./docs/adr.md`](./docs/adr.md)
 
 ## Architecture Overview
 
