@@ -1,0 +1,476 @@
+service: rds-outbox-demo
+
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: nodejs22.x
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 30
+  environment:
+    STAGE: ${self:provider.stage}
+    REGION: ${self:provider.region}
+
+functions:
+  createCar:
+    handler: lambda/create-car/src/index.handler
+    name: ${self:service}-${self:provider.stage}-createCar
+    description: Creates a car and writes event to outbox table
+    timeout: 29
+    memorySize: 256
+    role:
+      Fn::GetAtt:
+        - CreateCarLambdaRole
+        - Arn
+    environment:
+      DB_HOST:
+        Fn::GetAtt:
+          - Database
+          - Endpoint.Address
+      DB_PORT: "5432"
+      DB_NAME: "outboxdb"
+      DB_USER: "dbadmin"
+      DB_SECRET_ARN:
+        Ref: DatabaseSecret
+      DB_SSL: "true"
+    events:
+      - http:
+          path: cars
+          method: post
+          cors: true
+
+  cdcConsumer:
+    handler: lambda/cdc-consumer/src/index.handler
+    name: ${self:service}-${self:provider.stage}-cdcConsumer
+    description: Consumes Kinesis records and publishes to EventBridge
+    timeout: 60
+    memorySize: 256
+    role:
+      Fn::GetAtt:
+        - CdcConsumerLambdaRole
+        - Arn
+    environment:
+      EVENT_BUS_NAME: ${self:custom.eventBusName}
+    events:
+      - stream:
+          type: kinesis
+          arn:
+            Fn::GetAtt:
+              - OutboxStream
+              - Arn
+          batchSize: 10
+          startingPosition: LATEST
+          # Filter at the event source mapping so the Lambda only receives
+          # the DMS outbox INSERT records it knows how to process.
+          filterPatterns:
+            - data:
+                metadata:
+                  "record-type": ["data"]
+                  operation: ["insert"]
+                  "table-name": ["outbox"]
+
+resources:
+  Resources:
+    # Minimal VPC (required for RDS - simplified for demo)
+    DemoVPC:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: 10.0.0.0/16
+        EnableDnsHostnames: true
+        EnableDnsSupport: true
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${self:provider.stage}-vpc
+
+    # Internet Gateway
+    InternetGateway:
+      Type: AWS::EC2::InternetGateway
+      Properties:
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${self:provider.stage}-igw
+
+    InternetGatewayAttachment:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+        VpcId:
+          Ref: DemoVPC
+        InternetGatewayId:
+          Ref: InternetGateway
+
+    # Public Subnets (RDS requires at least 2 subnets in different AZs)
+    PublicSubnet1:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId:
+          Ref: DemoVPC
+        AvailabilityZone: ${self:provider.region}a
+        CidrBlock: 10.0.0.0/24
+        MapPublicIpOnLaunch: true
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${self:provider.stage}-public-subnet-1
+
+    PublicSubnet2:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId:
+          Ref: DemoVPC
+        AvailabilityZone: ${self:provider.region}b
+        CidrBlock: 10.0.1.0/24
+        MapPublicIpOnLaunch: true
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${self:provider.stage}-public-subnet-2
+
+    # Route Table
+    PublicRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId:
+          Ref: DemoVPC
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${self:provider.stage}-public-routes
+
+    DefaultPublicRoute:
+      Type: AWS::EC2::Route
+      DependsOn: InternetGatewayAttachment
+      Properties:
+        RouteTableId:
+          Ref: PublicRouteTable
+        DestinationCidrBlock: 0.0.0.0/0
+        GatewayId:
+          Ref: InternetGateway
+
+    PublicSubnet1RouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        RouteTableId:
+          Ref: PublicRouteTable
+        SubnetId:
+          Ref: PublicSubnet1
+
+    PublicSubnet2RouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        RouteTableId:
+          Ref: PublicRouteTable
+        SubnetId:
+          Ref: PublicSubnet2
+
+    # Security Group for RDS (allows access from anywhere for demo purposes)
+    DbSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Security group for RDS PostgreSQL (demo - allows public access)
+        VpcId:
+          Ref: DemoVPC
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            CidrIp: 0.0.0.0/0
+            Description: Allow PostgreSQL access from anywhere (demo only)
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${self:provider.stage}-db-sg
+
+    # DB Subnet Group (required for RDS)
+    DBSubnetGroup:
+      Type: AWS::RDS::DBSubnetGroup
+      Properties:
+        DBSubnetGroupName: ${self:service}-${self:provider.stage}-db-subnet-group
+        DBSubnetGroupDescription: Subnet group for RDS PostgreSQL (demo)
+        SubnetIds:
+          - Ref: PublicSubnet1
+          - Ref: PublicSubnet2
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${self:provider.stage}-db-subnet-group
+
+    # DB Parameter Group
+    DBParameterGroup:
+      Type: AWS::RDS::DBParameterGroup
+      Properties:
+        DBParameterGroupName: ${self:service}-${self:provider.stage}-db-params
+        Description: Parameter group for PostgreSQL with logical replication
+        Family: postgres16
+        Parameters:
+          rds.logical_replication: "1"
+          max_replication_slots: "10"
+          max_wal_senders: "10"
+
+    # Database Secret
+    DatabaseSecret:
+      Type: AWS::SecretsManager::Secret
+      Properties:
+        Name: ${self:service}-${self:provider.stage}-db-secret
+        Description: RDS PostgreSQL database credentials
+        GenerateSecretString:
+          SecretStringTemplate: '{"username":"dbadmin"}'
+          GenerateStringKey: password
+          PasswordLength: 32
+          ExcludeCharacters: \"@/\'%+
+
+    # RDS PostgreSQL Instance (publicly accessible for demo)
+    Database:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Delete
+      Properties:
+        DBInstanceIdentifier: ${self:service}-${self:provider.stage}-database
+        DBName: outboxdb
+        Engine: postgres
+        EngineVersion: "16.8"
+        DBInstanceClass: db.t3.micro
+        MasterUsername:
+          Fn::Sub:
+            - "{{resolve:secretsmanager:${SecretArn}:SecretString:username}}"
+            - SecretArn:
+                Ref: DatabaseSecret
+        MasterUserPassword:
+          Fn::Sub:
+            - "{{resolve:secretsmanager:${SecretArn}:SecretString:password}}"
+            - SecretArn:
+                Ref: DatabaseSecret
+        AllocatedStorage: 20
+        StorageType: gp3
+        VPCSecurityGroups:
+          - Ref: DbSecurityGroup
+        DBSubnetGroupName:
+          Ref: DBSubnetGroup
+        DBParameterGroupName:
+          Ref: DBParameterGroup
+        BackupRetentionPeriod: 7
+        DeletionProtection: false
+        PubliclyAccessible: true
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${self:provider.stage}-database
+
+    # Kinesis Data Stream
+    OutboxStream:
+      Type: AWS::Kinesis::Stream
+      Properties:
+        Name: ${self:custom.kinesisStreamName}
+        ShardCount: 1
+        RetentionPeriodHours: 24
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${self:provider.stage}-stream
+
+    # EventBridge Custom Bus
+    OutboxEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:custom.eventBusName}
+
+    # CloudWatch Logs Group for EventBridge events
+    EventBusLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: /aws/events/${self:custom.eventBusName}
+        RetentionInDays: 7
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${self:provider.stage}-eventbus-logs
+
+    # IAM Role for EventBridge to write to CloudWatch Logs
+    EventBridgeLogsRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:service}-${self:provider.stage}-eventbridge-logs-role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: CloudWatchLogsAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource:
+                    - Fn::GetAtt:
+                        - EventBusLogGroup
+                        - Arn
+
+    # EventBridge Rule to capture all events and send to CloudWatch Logs
+    EventBusLoggingRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-${self:provider.stage}-log-all-events
+        Description: Log all events from the outbox event bus to CloudWatch Logs
+        EventBusName:
+          Ref: OutboxEventBus
+        EventPattern:
+          source:
+            - prefix: ""
+        State: ENABLED
+        Targets:
+          - Arn:
+              Fn::GetAtt:
+                - EventBusLogGroup
+                - Arn
+            Id: "1"
+
+    # IAM Role for Lambda to access Secrets Manager
+    CreateCarLambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:service}-${self:provider.stage}-createCar-role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: SecretsManagerAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - secretsmanager:GetSecretValue
+                  Resource:
+                    - Ref: DatabaseSecret
+          - PolicyName: CloudWatchLogsAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource:
+                    - Fn::Sub: "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${self:service}-${self:provider.stage}-*:*"
+
+    # IAM Role for CDC Consumer Lambda
+    CdcConsumerLambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:service}-${self:provider.stage}-cdcConsumer-role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: EventBridgeAndKinesisAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - events:PutEvents
+                  Resource:
+                    - Fn::GetAtt:
+                        - OutboxEventBus
+                        - Arn
+                - Effect: Allow
+                  Action:
+                    - kinesis:DescribeStream
+                    - kinesis:GetShardIterator
+                    - kinesis:GetRecords
+                    - kinesis:ListShards
+                  Resource:
+                    - Fn::GetAtt:
+                        - OutboxStream
+                        - Arn
+          - PolicyName: CloudWatchLogsAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource:
+                    - Fn::Sub: "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${self:service}-${self:provider.stage}-*:*"
+
+  Outputs:
+    ApiEndpoint:
+      Description: API Gateway endpoint URL
+      Value:
+        Fn::Join:
+          - ""
+          - - "https://"
+            - Ref: ApiGatewayRestApi
+            - ".execute-api."
+            - ${self:provider.region}
+            - ".amazonaws.com/"
+            - ${self:provider.stage}
+            - "/cars"
+
+    DatabaseEndpoint:
+      Description: RDS PostgreSQL endpoint
+      Value:
+        Fn::GetAtt:
+          - Database
+          - Endpoint.Address
+
+    DatabaseSecretArn:
+      Description: RDS database secret ARN
+      Value:
+        Ref: DatabaseSecret
+
+    KinesisStreamName:
+      Description: Kinesis Data Stream name
+      Value:
+        Ref: OutboxStream
+
+    KinesisStreamArn:
+      Description: Kinesis Data Stream ARN
+      Value:
+        Fn::GetAtt:
+          - OutboxStream
+          - Arn
+
+    EventBusName:
+      Description: EventBridge Custom Bus name
+      Value:
+        Ref: OutboxEventBus
+
+    EventBusArn:
+      Description: EventBridge Custom Bus ARN
+      Value:
+        Fn::GetAtt:
+          - OutboxEventBus
+          - Arn
+
+    EventBusLogGroupName:
+      Description: CloudWatch Logs group name for EventBridge events
+      Value:
+        Ref: EventBusLogGroup
+
+    VpcId:
+      Description: VPC ID (required for DMS setup)
+      Value:
+        Ref: DemoVPC
+
+    DatabaseSecurityGroupId:
+      Description: RDS Database Security Group ID (required for DMS setup)
+      Value:
+        Ref: DbSecurityGroup
+
+custom:
+  eventBusName: ${self:service}-${self:provider.stage}-events-bus
+  kinesisStreamName: ${self:service}-${self:provider.stage}-stream
+
+plugins:
+  - serverless-plugin-typescript
+  - serverless-offline

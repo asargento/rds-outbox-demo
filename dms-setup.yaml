@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "DMS Configuration for Outbox Pattern Demo - Replicates PostgreSQL outbox table to Kinesis"
+
+Parameters:
+  StackName:
+    Type: String
+    Description: Name of the main serverless stack (e.g., rds-outbox-demo-dev)
+    Default: rds-outbox-demo-dev
+
+  DatabaseEndpoint:
+    Type: String
+    Description: RDS PostgreSQL endpoint address
+
+  DatabaseSecretArn:
+    Type: String
+    Description: ARN of the database secret in Secrets Manager
+
+  KinesisStreamArn:
+    Type: String
+    Description: ARN of the Kinesis Data Stream
+
+  VpcId:
+    Type: String
+    Description: VPC ID where RDS is located
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of subnet IDs (at least 2 in different AZs)
+
+Resources:
+  # IAM Role for DMS to access Kinesis
+  DmsKinesisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-dms-kinesis-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:ListStreams
+                  - kinesis:DescribeStream
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !Ref KinesisStreamArn
+
+  # Security Group for DMS Replication Instance
+  DmsReplicationInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for DMS replication instance
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic (needed to connect to RDS and Kinesis)
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-dms-sg"
+
+  # Security Group for VPC Endpoint
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Kinesis VPC endpoint
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref DmsReplicationInstanceSecurityGroup
+          Description: Allow HTTPS from DMS replication instance
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc-endpoint-sg"
+
+  # VPC Endpoint for Kinesis (required for DMS replication instance in private subnet)
+  KinesisVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.kinesis-streams"
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      PrivateDnsEnabled: true
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - kinesis:PutRecord
+              - kinesis:PutRecords
+              - kinesis:DescribeStream
+            Resource: !Ref KinesisStreamArn
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-kinesis-vpc-endpoint"
+
+  # DMS Replication Subnet Group
+  DmsReplicationSubnetGroup:
+    Type: AWS::DMS::ReplicationSubnetGroup
+    Properties:
+      ReplicationSubnetGroupIdentifier: !Sub "${AWS::StackName}-dms-subnet-group"
+      ReplicationSubnetGroupDescription: Subnet group for DMS replication instance
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-dms-subnet-group"
+
+  # DMS Replication Instance
+  DmsReplicationInstance:
+    Type: AWS::DMS::ReplicationInstance
+    Properties:
+      ReplicationInstanceIdentifier: !Sub "${AWS::StackName}-replication-instance"
+      ReplicationInstanceClass: dms.t3.micro
+      AllocatedStorage: 20
+      PubliclyAccessible: false
+      VpcSecurityGroupIds:
+        - !Ref DmsReplicationInstanceSecurityGroup
+      ReplicationSubnetGroupIdentifier: !Ref DmsReplicationSubnetGroup
+      EngineVersion: "3.5.3"
+      MultiAZ: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-replication-instance"
+
+  # DMS Source Endpoint (PostgreSQL)
+  DmsSourceEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub "${AWS::StackName}-source-endpoint"
+      EndpointType: source
+      EngineName: postgres
+      ServerName: !Ref DatabaseEndpoint
+      Port: 5432
+      DatabaseName: outboxdb
+      Username: dbadmin
+      Password: !Sub "{{resolve:secretsmanager:${DatabaseSecretArn}:SecretString:password}}"
+      SslMode: require
+      ExtraConnectionAttributes: "heartbeatFrequency=5;"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-source-endpoint"
+
+  # DMS Target Endpoint (Kinesis)
+  DmsTargetEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub "${AWS::StackName}-target-endpoint"
+      EndpointType: target
+      EngineName: kinesis
+      KinesisSettings:
+        MessageFormat: json
+        StreamArn: !Ref KinesisStreamArn
+        ServiceAccessRoleArn: !GetAtt DmsKinesisRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-target-endpoint"
+
+  # DMS Replication Task
+  DmsReplicationTask:
+    Type: AWS::DMS::ReplicationTask
+    Properties:
+      ReplicationTaskIdentifier: !Sub "${AWS::StackName}-replication-task"
+      ReplicationInstanceArn: !Ref DmsReplicationInstance
+      SourceEndpointArn: !Ref DmsSourceEndpoint
+      TargetEndpointArn: !Ref DmsTargetEndpoint
+      MigrationType: cdc
+      TableMappings: |
+        {
+          "rules": [
+            {
+              "rule-type": "selection",
+              "rule-id": "1",
+              "rule-name": "1",
+              "object-locator": {
+                "schema-name": "public",
+                "table-name": "outbox"
+              },
+              "rule-action": "include"
+            }
+          ]
+        }
+      ReplicationTaskSettings: |
+        {
+          "TargetMetadata": {
+            "TargetSchema": "",
+            "SupportLobs": true,
+            "FullLobMode": false,
+            "LobChunkSize": 0,
+            "LimitedSizeLobMode": true,
+            "LobMaxSize": 32,
+            "InlineLobMaxSize": 0,
+            "LoadMaxFileSize": 0,
+            "ParallelLoadThreads": 0,
+            "ParallelLoadBufferSize": 0,
+            "BatchApplyEnabled": false,
+            "TaskRecoveryTableEnabled": false,
+            "TaskRecoveryTableSchemaName": "",
+            "ParallelApplyThreads": 0,
+            "ParallelApplyBufferSize": 0,
+            "ParallelApplyQueuesPerThread": 0
+          },
+          "FullLoadSettings": {
+            "TargetTablePrepMode": "DO_NOTHING",
+            "CreatePkAsFullLoadPk": true,
+            "StopTaskCachedChangesApplied": false,
+            "StopTaskCachedChangesNotApplied": false,
+            "MaxFullLoadSubTasks": 8,
+            "TransactionConsistencyTimeout": 600,
+            "CommitRate": 10000
+          },
+          "Logging": {
+            "EnableLogging": true
+          },
+          "StreamBufferSettings": {
+            "StreamBufferCount": 3,
+            "StreamBufferSizeInMB": 8
+          }
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-replication-task"
+
+Outputs:
+  ReplicationInstanceArn:
+    Description: ARN of the DMS Replication Instance
+    Value: !Ref DmsReplicationInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-ReplicationInstanceArn"
+
+  ReplicationTaskArn:
+    Description: ARN of the DMS Replication Task
+    Value: !Ref DmsReplicationTask
+    Export:
+      Name: !Sub "${AWS::StackName}-ReplicationTaskArn"
+
+  SourceEndpointArn:
+    Description: ARN of the DMS Source Endpoint
+    Value: !Ref DmsSourceEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-SourceEndpointArn"
+
+  TargetEndpointArn:
+    Description: ARN of the DMS Target Endpoint
+    Value: !Ref DmsTargetEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetEndpointArn"
+
+  ReplicationTaskStatus:
+    Description: Status of the DMS Replication Task (start it manually after deployment)
+    Value: "Ready to start - Use AWS CLI or Console to start the replication task"

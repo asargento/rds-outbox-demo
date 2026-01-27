@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.serverless/
+*.log
+.env
+serverless.env.yml
+.DS_Store
+*.swp
+*.swo
+*~
