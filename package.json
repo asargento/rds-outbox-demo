@@ -24,9 +24,9 @@
     "author": "",
     "license": "MIT",
     "dependencies": {
-        "@aws-sdk/client-eventbridge": "^3.490.0",
-        "@aws-sdk/client-kinesis": "^3.490.0",
-        "@aws-sdk/client-secrets-manager": "^3.490.0",
+        "@aws-sdk/client-eventbridge": "^3.995.0",
+        "@aws-sdk/client-kinesis": "^3.995.0",
+        "@aws-sdk/client-secrets-manager": "^3.995.0",
         "pg": "^8.11.3"
     },
     "devDependencies": {
